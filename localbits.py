@@ -1,65 +1,133 @@
 # -*- coding: utf-8 -*-
-import os
 from src.api.localbitcoins_api import LocalBitcoinsApi
+from twilio.rest import TwilioRestClient
+from twilio.exceptions import TwilioException
+from src.settings.base import TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, \
+    TWILIO_PHONE_FROM
 import shelve
 
-
-DEFAULT_KEY = \
-    'd7441f99f41e3297b786dd279474abf6'
-DEFAULT_SECRET = \
-    '21049bfe9cedcd4dd07a0ccb76e72ef4b50768be21ff02f4543caadd9e90d413'
-
-PERSISTENT_STORAGE_INITIAL = 'shelve_initial.txt'
-PERSISTENT_STORAGE_AWAITING = 'shelve_awaiting.txt'
+PERSISTENT_STORAGE_INITIAL = 'shelve_initial_{}_{}.txt'
+PERSISTENT_STORAGE_AWAITING = 'shelve_awaiting_{}_{}.txt'
+NEW_CONTACT_TEMPLATE = 'New contact! \nAccount: {} is {} {} BTC FOR {}'
+NEW_DISPUTE_TEMPLATE = '!!!Dispute!!! \nAccount: {}  is {} {} BTC FOR {}'
 
 
 class TradingHelper(object):
-    OUR_NAME = 'nexchange.ru'
+    BUY = 'buy'
+    SELL = 'sell'
+    CONTACT_ID = 'contact_id'
+    IS_DISPUTE = 'disputed_at'
+    IS_BUYING = 'is_buying'
 
-    def __init__(self, localbitcoins_api):
-        self.bit = localbitcoins_api
-        self.storage_contacts_initial = \
-            shelve.open(PERSISTENT_STORAGE_INITIAL)
-        self.storage_contacts_awaiting = \
-            shelve.open(PERSISTENT_STORAGE_AWAITING)
+    def __init__(self, account, subscribed_phones, name):
+        self.name = name
+        self.subscribed_phones = subscribed_phones
+        self.bit = account
+        self.contacts = [{}]
+
+        # BUY storage
+        self.storage_contacts_initial_buy = \
+            shelve.open(PERSISTENT_STORAGE_INITIAL.format(TradingHelper.BUY, self.name))
+        self.storage_contacts_awaiting_sell = \
+            shelve.open(PERSISTENT_STORAGE_AWAITING.format(TradingHelper.BUY, self.name))
+
+        # SELL storage
+        self.storage_contacts_initial_sell = \
+            shelve.open(PERSISTENT_STORAGE_INITIAL.format(TradingHelper.SELL, self.name))
 
     def check_messages(self):
-        bit = LocalBitcoinsApi(key, sec, True)
-        dashboard = bit.get_dashboard()
-        contacts = dashboard['contact_list']
-        active_contact_ids = [str(x['data']['contact_id']) for
-                              x in contacts]
+        dashboard = self.bit.get_dashboard()
+        self.contacts = dashboard['contact_list']
+        if not self.contacts:
+            print({"message": "No contacts, Exiting"})
+            return
+        for contact_index, contact in enumerate(self.contacts):
+            contact_id = str(contact['data'][TradingHelper.CONTACT_ID])
+            trad_type = TradingHelper.BUY if contact['data'][TradingHelper.IS_BUYING] \
+                else TradingHelper.SELL
+            is_disputed = contact['data'][TradingHelper.IS_DISPUTE]
+            if trad_type == TradingHelper.SELL:
+                self.handle_sell(contact, contact_id, is_disputed)
+            else:
+                self.handle_buy(contact, contact_id, is_disputed)
 
-        for index, contact_id in enumerate(active_contact_ids):
-            contact_id = str(contact_id)
-            if not self.storage_contacts_initial.has_key(contact_id):
+    def handle_buy(self, contact, contact_id, is_disputed):
+        if not self.storage_contacts_initial_sell.has_key(contact_id):
+            self.send_sms(contact, is_disputed)
+            if not is_disputed:
+                self.say_hello(contact)
+                self.storage_contacts_initial_buy[contact_id] = True
+                self.storage_contacts_initial_buy.sync()
+
+        self.clean_old_contacts()
+
+    def handle_sell(self, contact, contact_id, is_disputed):
+        if not self.storage_contacts_initial_sell.has_key(contact_id):
+            self.send_sms(contact, is_disputed)
+            if not is_disputed:
                 self.say_hello(contact_id)
                 self.offer_payment_methods(contact_id)
-                self.storage_contacts_initial[contact_id] = True
-                self.storage_contacts_initial.sync()
+                self.storage_contacts_initial_sell[contact_id] = True
+                self.storage_contacts_initial_sell.sync()
 
-            messages = bit.get_contact_messages(contact_id)
-            client_messages = [msg for msg in messages['message_list']
-                               if TradingHelper.OUR_NAME not in msg['sender']['name']]
-            if not self.storage_contacts_awaiting.has_key(contact_id) \
-                    and len(client_messages):
-                bank_message = self.determine_bank_msg(client_messages)
-                if len(bank_message):
-                    self.bit.post_message_to_contact(contact_id, bank_message)
-                    self.storage_contacts_awaiting[contact_id] = True
+        messages = self.bit.get_contact_messages(contact_id)
+        client_messages = [msg for msg in messages['message_list']
+                           if self.name not in msg['sender']['name']]
+        if not self.storage_contacts_awaiting_sell.has_key(contact_id) \
+                and client_messages:
+            bank_message = self.determine_bank_msg(client_messages)
+            if len(bank_message):
+                self.bit.post_message_to_contact(contact_id, bank_message)
+                self.storage_contacts_awaiting_sell[contact_id] = True
 
-        self.clean_old_contacts(active_contact_ids)
-        self.storage_contacts_initial.close()
-        self.storage_contacts_awaiting.close()
+        self.clean_old_contacts()
+        self.storage_contacts_initial_buy.close()
+        self.storage_contacts_awaiting_sell.close()
 
-    def clean_old_contacts(self, active_contact_ids):
-        old_contacts = [contact_id for contact_id in self.storage_contacts_initial
+    def send_sms(self, contact, is_dispute):
+        if contact['data']['is_buying']:
+            key = 'seller'
+            action = 'SELLING'
+        else:
+            key = 'buyer'
+            action = 'BUYING'
+
+        template = NEW_DISPUTE_TEMPLATE if is_dispute \
+            else NEW_CONTACT_TEMPLATE
+        msg = template.format(
+            contact['data'][key]['username'],
+            action,
+            contact['data']['amount_btc'],
+            contact['data']['amount']
+        )
+
+        errors = []
+        messages = []
+        for phone in self.subscribed_phones:
+            try:
+                client = TwilioRestClient(
+                    TWILIO_ACCOUNT_SID,
+                    TWILIO_AUTH_TOKEN)
+                message = client.messages.create(
+                    body=msg, to=phone, from_=TWILIO_PHONE_FROM)
+                messages.append(message)
+            except TwilioException as err:
+                errors.append(err)
+        return errors, messages
+
+    def clean_old_contacts(self):
+        active_contact_ids = [c['data'][TradingHelper.CONTACT_ID] for c in self.contacts]
+        old_contacts = [contact_id for contact_id in self.storage_contacts_initial_buy
                         if contact_id not in active_contact_ids]
         for contact_id in old_contacts:
-            if self.storage_contacts_initial.has_key(contact_id):
-                del self.storage_contacts_initial[contact_id]
-            if self.storage_contacts_awaiting.has_key(contact_id):
-                del self.storage_contacts_awaiting[contact_id]
+            if self.storage_contacts_initial_buy.has_key(contact_id):
+                del self.storage_contacts_initial_buy[contact_id]
+
+            if self.storage_contacts_initial_sell.has_key(contact_id):
+                del self.storage_contacts_initial_sell[contact_id]
+
+            if self.storage_contacts_awaiting_sell.has_key(contact_id):
+                del self.storage_contacts_awaiting_sell[contact_id]
                 self.spam_after_deal(contact_id)
                 self.leave_feedback(contact_id)
 
@@ -78,15 +146,7 @@ class TradingHelper(object):
         # TODO: add feedback
         pass
 
-    def determine_bank_msg(self, messages):
-        def escape(txt):
-            try:
-                escaped = repr(txt.encode('utf-8'))
-            except UnicodeDecodeError:
-                escaped = txt
-
-            return escaped.upper()
-
+    def determine_bank_msg(self, contact):
         def tokenize(msg):
             output = []
             for index, sequence in enumerate(tokens):
@@ -97,10 +157,10 @@ class TradingHelper(object):
 
             return output
 
-        suffix = ' Инициалы: О. Б.'
+        suffix = '\n Инициалы: О. Б. \n назначение платежа: {} (важно!)'
         tokens = [
             ['sber', 'Сбер', 'cber', 'sbr', 'Сбр'],
-            ['alfa', 'Альфа', 'Алфа', 'alpha'],
+            ['alfa', 'Альфа', 'Алфа', 'alpha', 'Альфы', 'Алфы'],
             ['raif', 'Райф']
         ]
 
@@ -125,9 +185,32 @@ class TradingHelper(object):
 
 
 if __name__ == '__main__':
-    key = os.getenv('LOCALBTC_KEY', DEFAULT_KEY)
-    sec = os.getenv('LOCALBTC_KEY', DEFAULT_SECRET)
-    debug = False
-    local_bit = LocalBitcoinsApi(key, sec, debug)
-    helper = TradingHelper(local_bit)
-    helper.check_messages()
+    accounts = [
+        {
+            'name': 'nexchange.ru',
+            'secret': '00c1d059d00862dd1815419adf515f7c340efb4743d0e88dd4948a59664f5081',
+            'key': 'a969c2abe1d778ff145421251307f667',
+            'subscribed_phones': [
+                '+79254497306',
+                '+79153077459'
+            ]
+        },
+        {
+            'name': 'Nexchange',
+            'secret': '0467413b4aa66b2a1dd48f04cd7523dd6611685c3968b190a0598e335345943b',
+            'key': 'e46f5e105915bfd665dd22287d5467b0',
+            'subscribed_phones': [
+                '+79254497306',
+                '+79153077459'
+            ]
+        }
+    ]
+
+    for index, account in enumerate(accounts):
+        api = LocalBitcoinsApi(account['key'], account['secret'])
+
+        debug = False
+
+        helper = TradingHelper(api, account['subscribed_phones'],
+                               account['name'])
+        helper.check_messages()
